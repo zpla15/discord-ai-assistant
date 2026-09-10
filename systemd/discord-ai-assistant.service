@@ -1,0 +1,43 @@
+[Unit]
+Description=Personal Discord AI assistant (Claude Code CLI backed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nova
+WorkingDirectory=/home/nova/projects/discord-ai-assistant
+EnvironmentFile=/home/nova/projects/discord-ai-assistant/.env
+ExecStart=/usr/bin/node /home/nova/projects/discord-ai-assistant/dist/index.js
+# always, not on-failure: `!restart` from Discord works by exiting cleanly and
+# letting systemd bring the process back, so a zero exit must also restart.
+# An explicit `systemctl stop` still stops the service for good.
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectHome=read-only
+# The bot itself only needs the project dir, but the claude CLI it spawns must
+# be able to write its conversation transcripts under ~/.claude (otherwise
+# --resume never finds the previous session and every message starts fresh)
+# and its own state file ~/.claude.json.
+ReadWritePaths=/home/nova/projects /home/nova/.claude /home/nova/.claude.json
+ProtectSystem=strict
+PrivateTmp=true
+
+# Credentials the bot must never be able to read. Bash is a real shell and is
+# NOT confined to --add-dir, and the tool allowlist contains cat/grep/find/ls,
+# so any deny-list entry here would be trivially bypassed by rewriting the path
+# (`cat ~/.gitcreds/work` vs `cat /home/nova/.gitcreds/work` vs `grep -r . ~`).
+# Blocking at the OS level holds regardless of how the command is spelled.
+#   .gitcreds  — work GitHub token, plaintext (git credential store format)
+#   .config/gh — personal GitHub API token (gh auth)
+#   .ssh       — ssh keys / authorized_keys
+# None is needed by the bot: the git commands on the allowlist are read-only and
+# operate on already-cloned repositories, and `git push` is denied outright.
+# The leading "-" makes a path optional so the unit still starts if it is absent.
+InaccessiblePaths=-/home/nova/.gitcreds -/home/nova/.config/gh -/home/nova/.ssh
+
+[Install]
+WantedBy=multi-user.target
