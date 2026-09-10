@@ -41,6 +41,21 @@ export const CLAUDE_TOOLS = [
 // harmless-but-complex invocations (piped `ps`, etc). Add new safe commands
 // here as real use cases surface, rather than guessing everything upfront.
 export const CLAUDE_ALLOWED_TOOLS = [
+  // 파일 수정. Under --permission-mode dontAsk, tools absent from this list are
+  // denied — read-only tools (Read/Glob/Grep) auto-approve, but the mutating
+  // ones do not, so without these entries the agent could diagnose a bug and
+  // then be blocked from fixing it (empirically confirmed 2026-09-02: Edit and
+  // Write were both denied on a working "fix the failing test" task).
+  //
+  // Safe to grant unscoped because --restricted confines the file tools to the
+  // working directories (--add-dir), i.e. the channel's own workspaceDir — a
+  // real boundary, unlike Bash, which --restricted does NOT confine. Writes to
+  // settings, git and tool-configuration files still require human approval
+  // even with these allowed.
+  "Edit",
+  "Write",
+  "TodoWrite",
+
   // 서버 상태 조회
   "Bash(uptime*)",
   "Bash(free*)",
@@ -87,12 +102,28 @@ export const CLAUDE_ALLOWED_TOOLS = [
   "Bash(ls*)",
   "Bash(pwd)",
 
-  // git 조회 (push 제외)
+  // git 조회 + 로컬/원격 작업. push는 사용자가 그때그때 명시적으로 요청한 경우에만
+  // 쓰도록 CLAUDE_SYSTEM_PROMPT에서 별도로 안내함 (기술적 강제 장치는 없음).
   "Bash(git status*)",
   "Bash(git diff*)",
   "Bash(git log*)",
   "Bash(git branch*)",
   "Bash(git show*)",
+  "Bash(git clone*)",
+  "Bash(git pull*)",
+  "Bash(git fetch*)",
+  "Bash(git add*)",
+  "Bash(git commit*)",
+  "Bash(git checkout*)",
+  "Bash(git merge*)",
+  "Bash(git stash*)",
+  "Bash(git push*)",
+
+  // GitHub CLI 인증 (디바이스 코드 방식 - 사용자가 브라우저에서 직접 로그인)
+  "Bash(gh --version)",
+  "Bash(gh auth login*)",
+  "Bash(gh auth status*)",
+  "Bash(gh repo clone*)",
 
   // 코드 수정/테스트
   "Bash(npm test*)",
@@ -102,6 +133,45 @@ export const CLAUDE_ALLOWED_TOOLS = [
   "Bash(node*)",
   "Bash(npx*)",
 ] as const;
+
+/**
+ * Appended to Claude Code's own system prompt on every run.
+ *
+ * Why this exists: CLAUDE_ALLOWED_TOOLS matches on the *prefix of the whole
+ * command string*, so a chained command like `cd /x && git status` matches no
+ * entry and is denied even though `git status` alone is allowed. Left to its
+ * own devices the model batches commands with && / ; / | (normally good
+ * practice) and every one of those calls gets denied, so it flails and gives
+ * up. Telling it the shape of the constraint up front is far cheaper than
+ * loosening the policy — and loosening is not even safe here, since adding
+ * e.g. `Bash(cd*)` would let `cd /tmp && rm -rf ~` slip past the deny-list,
+ * which is also prefix-matched.
+ */
+export const CLAUDE_SYSTEM_PROMPT = [
+  "당신은 Discord를 통해 이 서버를 관리하는 비서입니다. 응답은 Discord 메시지로 전달됩니다.",
+  "",
+  "## Bash 도구 제약 (매우 중요)",
+  "이 환경의 Bash 허용 목록은 '명령어 문자열의 앞부분'으로 매칭됩니다. 따라서:",
+  "- **한 번의 Bash 호출에는 명령어를 하나만** 쓰세요.",
+  "- `&&`, `;`, `|`, `$(...)`로 명령을 연결하면 조각 각각이 허용되어 있어도 **전체가 거부**됩니다.",
+  "- `cd`를 쓰지 말고 **절대 경로**를 직접 넘기세요. (`cd /a && ls` ❌ → `ls /a` ✅)",
+  "- 여러 정보가 필요하면 Bash를 여러 번 나눠서 호출하세요. 병렬 호출도 가능합니다.",
+  "",
+  "## 파일 작업은 Bash 대신 전용 도구를 쓰세요",
+  "Read, Glob, Grep, Edit, Write는 위 제약을 받지 않고 작업 디렉터리 안에서 자유롭게 동작합니다.",
+  "파일을 읽고 찾고 고치는 일은 `cat`/`find`/`grep` 대신 이 도구들을 우선 사용하세요.",
+  "",
+  "## 막혔을 때",
+  "권한이 거부되면 추측하거나 우회하려 하지 말고, 사용자에게 **서버에서 직접 실행해야 할 명령어를 그대로 알려주세요.**",
+  "sudo, 패키지 설치, 서비스 재시작, 방화벽 변경은 설계상 항상 차단되어 있습니다 — 버그가 아닙니다.",
+  "",
+  "## git push",
+  "git push는 도구상으로는 허용되어 있지만, 해당 메시지에서 사용자가 명시적으로 push를 요청한 경우에만 실행하세요.",
+  "먼저 요청받지 않은 작업(코드 수정, clone, commit 등)을 끝냈다고 해서 임의로 push까지 이어서 하지 마세요.",
+  "",
+  "## 응답 형식",
+  "Discord 메시지는 길면 잘립니다. 결론을 먼저 쓰고 간결하게 답하세요. 긴 로그는 핵심만 인용하세요.",
+].join("\n");
 
 export const CLAUDE_DISALLOWED_TOOLS = [
   // 권한 상승
@@ -169,7 +239,4 @@ export const CLAUDE_DISALLOWED_TOOLS = [
   "Bash(curl* | bash*)",
   "Bash(wget* | sh*)",
   "Bash(wget* | bash*)",
-
-  // 원격 저장소 반영 방지 (로컬 커밋까지는 허용, push는 사람이 검토 후 수동으로)
-  "Bash(git push*)",
 ] as const;
