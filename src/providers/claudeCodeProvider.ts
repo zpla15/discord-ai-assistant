@@ -10,8 +10,6 @@ export interface ClaudeCodeLogger {
 export interface ClaudeCodeProviderConfig {
   /** Absolute path to the claude CLI binary. */
   readonly claudeBin: string;
-  /** Directory Claude is confined to (passed to --add-dir and used as cwd). */
-  readonly workspaceDir: string;
   /** Kill the process if combined stdout+stderr exceeds this many bytes. */
   readonly maxOutputBytes: number;
   /** Built-in tool names to enable at all, e.g. ["Read", "Edit", "Bash"]. Anything not listed does not exist for the model. */
@@ -20,6 +18,8 @@ export interface ClaudeCodeProviderConfig {
   readonly allowedTools: readonly string[];
   /** Defense-in-depth denials, e.g. ["Bash(sudo*)", "Bash(rm -rf*)"]. */
   readonly disallowedTools: readonly string[];
+  /** Appended to Claude Code's built-in system prompt; tells the model the shape of the tool policy so it doesn't fight it. */
+  readonly systemPrompt?: string;
   /** Grace period after SIGTERM before escalating to SIGKILL. */
   readonly killGraceMs?: number;
 }
@@ -27,17 +27,21 @@ export interface ClaudeCodeProviderConfig {
 interface ClaudeResultPayload {
   readonly is_error: boolean;
   readonly result: string;
+  readonly session_id?: string;
   readonly permission_denials?: readonly unknown[];
 }
 
 const DEFAULT_KILL_GRACE_MS = 5000;
 
 /**
- * Runs the Claude Code CLI non-interactively, one prompt per invocation
- * (stateless by design — see plan doc). Never uses
+ * Runs the Claude Code CLI non-interactively. Each call is confined to the
+ * `workspaceDir` given in its options (cwd + --add-dir) and, when
+ * `sessionId` is given, continues that conversation via --resume instead of
+ * starting fresh — the caller (commandRouter, per Discord channel) owns
+ * which workspace/session a given prompt belongs to. Never uses
  * --dangerously-skip-permissions: the tool surface is locked down via
- * --restricted + an explicit --tools allowlist so out-of-scope actions are
- * simply unavailable to the model rather than something to approve.
+ * --restricted + an explicit --tools list so out-of-scope actions are simply
+ * unavailable to the model rather than something to approve.
  */
 export class ClaudeCodeProvider implements AIProvider {
   constructor(
@@ -46,10 +50,15 @@ export class ClaudeCodeProvider implements AIProvider {
   ) {}
 
   async run(prompt: string, options: AIProviderOptions): Promise<TaskResult> {
-    return this.execute(this.buildArgs(prompt), options.timeoutMs);
+    return this.execute(
+      this.buildArgs(prompt, options),
+      options.timeoutMs,
+      options.workspaceDir,
+      options.sessionId,
+    );
   }
 
-  private buildArgs(prompt: string): string[] {
+  private buildArgs(prompt: string, options: AIProviderOptions): string[] {
     const args = [
       "-p",
       prompt,
@@ -57,27 +66,38 @@ export class ClaudeCodeProvider implements AIProvider {
       "json",
       "--restricted",
       "--add-dir",
-      this.config.workspaceDir,
+      options.workspaceDir,
       "--tools",
       this.config.tools.join(","),
       "--permission-mode",
       "dontAsk",
     ];
 
+    if (this.config.systemPrompt) {
+      args.push("--append-system-prompt", this.config.systemPrompt);
+    }
     if (this.config.allowedTools.length > 0) {
       args.push("--allowedTools", this.config.allowedTools.join(","));
     }
     if (this.config.disallowedTools.length > 0) {
       args.push("--disallowedTools", this.config.disallowedTools.join(","));
     }
+    if (options.sessionId) {
+      args.push("--resume", options.sessionId);
+    }
 
     return args;
   }
 
-  private execute(args: readonly string[], timeoutMs: number): Promise<TaskResult> {
+  private execute(
+    args: readonly string[],
+    timeoutMs: number,
+    workspaceDir: string,
+    resumedSessionId: string | undefined,
+  ): Promise<TaskResult> {
     return new Promise((resolve) => {
       const child = spawn(this.config.claudeBin, args, {
-        cwd: this.config.workspaceDir,
+        cwd: workspaceDir,
         env: minimalEnv(),
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -140,14 +160,25 @@ export class ClaudeCodeProvider implements AIProvider {
           finish({ ok: false, text: "응답 크기가 제한을 초과해 작업을 중단했습니다." });
           return;
         }
-        finish(this.parseResult(code, stdout, stderr));
+        finish(this.parseResult(code, stdout, stderr, resumedSessionId));
       });
     });
   }
 
-  private parseResult(exitCode: number | null, stdout: string, stderr: string): TaskResult {
+  private parseResult(
+    exitCode: number | null,
+    stdout: string,
+    stderr: string,
+    resumedSessionId: string | undefined,
+  ): TaskResult {
     const trimmed = stdout.trim();
     if (trimmed.length === 0) {
+      if (resumedSessionId && /No conversation found with session ID/i.test(stderr)) {
+        this.logger.warn("이어가려던 세션을 더 이상 찾을 수 없음, 새 세션으로 재시도 예정", {
+          sessionId: resumedSessionId,
+        });
+        return { ok: false, text: "", sessionExpired: true };
+      }
       this.logger.warn("claude 출력이 비어 있음", { exitCode, stderr: stderr.slice(0, 500) });
       return { ok: false, text: "Claude Code로부터 응답을 받지 못했습니다." };
     }
@@ -169,7 +200,7 @@ export class ClaudeCodeProvider implements AIProvider {
       this.logger.warn("claude 권한 거부 발생", { denials: parsed.permission_denials });
     }
 
-    return { ok: !parsed.is_error, text: parsed.result };
+    return { ok: !parsed.is_error, text: parsed.result, sessionId: parsed.session_id };
   }
 }
 

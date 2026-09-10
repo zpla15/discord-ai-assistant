@@ -73,8 +73,19 @@ export class DiscordAdapter implements MessageAdapter {
       withProgress: (fn) => withTypingIndicator(channel, fn),
     };
 
+    // In a thread, message.channelId is the *thread's* id. Access control and
+    // the workspace mapping are configured per parent channel, so resolve to
+    // the parent for those; the thread id still keys the session, giving each
+    // thread its own independent conversation.
+    const configChannelId = channel.isThread() ? (channel.parentId ?? message.channelId) : message.channelId;
+
     this.router.handle(
-      { text: message.content, userId: message.author.id, channelId: message.channelId },
+      {
+        text: message.content,
+        userId: message.author.id,
+        channelId: message.channelId,
+        configChannelId,
+      },
       responder,
     );
   }
